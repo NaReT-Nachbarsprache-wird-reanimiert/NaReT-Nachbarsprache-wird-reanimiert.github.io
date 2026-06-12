@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>NaReT Lernplattform – Zugang</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(1200px 800px at 20% 10%, #14385f, #0b2238);
+    color: #eef3f8;
+  }
+  .card {
+    width: min(92vw, 380px); padding: 32px 28px; border-radius: 16px;
+    background: rgba(255, 255, 255, .06); border: 1px solid rgba(255, 255, 255, .12);
+    backdrop-filter: blur(8px); box-shadow: 0 18px 50px rgba(0, 0, 0, .35);
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  .sub { margin: 0 0 20px; color: #b8c7d6; font-size: .9rem; }
+  form { display: grid; gap: 10px; }
+  input {
+    width: 100%; padding: 12px 14px; border-radius: 10px; font-size: 1rem;
+    border: 1px solid rgba(255, 255, 255, .25); background: rgba(255, 255, 255, .92); color: #0b2238;
+  }
+  input:focus { outline: 2px solid #e2493b; border-color: transparent; }
+  button {
+    padding: 12px 14px; border-radius: 10px; border: 0; cursor: pointer;
+    background: #e2493b; color: #fff; font-size: 1rem; font-weight: 600;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  #msg { min-height: 1.2em; margin: 14px 0 0; font-size: .9rem; color: #ffb4ab; }
+  #msg.ok { color: #b8e0b9; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>NaReT Lernplattform</h1>
+  <p class="sub">Interne Vorschau – bitte Passwort eingeben.</p>
+  <form id="f">
+    <input id="pw" type="password" placeholder="Passwort" autocomplete="current-password" required autofocus>
+    <button id="go" type="submit">Öffnen</button>
+  </form>
+  <p id="msg" role="status"></p>
+  <noscript><p>Diese Seite benötigt JavaScript.</p></noscript>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const msg = (t, ok) => { $("msg").textContent = t; $("msg").className = ok ? "ok" : ""; };
+
+  if (!("serviceWorker" in navigator) || !window.crypto || !window.crypto.subtle) {
+    msg("Dieser Browser wird nicht unterstützt (Service Worker und WebCrypto erforderlich).");
+    $("go").disabled = true;
+    return;
+  }
+
+  // Die SW-Registrierung läuft im Hintergrund an; der Submit-Handler muss
+  // aber SOFORT hängen: sonst löst ein schnelles Enter (Passwortmanager,
+  // langsames Netz) ein natives Form-Submit aus und die Seite lädt
+  // kommentarlos neu, Eingabe weg.
+  const boot = (async () => {
+    const reg = await navigator.serviceWorker.register("./sw.js");
+    await navigator.serviceWorker.ready;
+    return reg;
+  })();
+  boot.catch((e) => {
+    msg("Service Worker konnte nicht gestartet werden: " + (e.message || e));
+    $("go").disabled = true;
+  });
+
+  const ask = async (m) => {
+    const reg = await boot;
+    return new Promise((resolve, reject) => {
+      const ch = new MessageChannel();
+      const t = setTimeout(() => reject(new Error("Service Worker antwortet nicht")), 8000);
+      ch.port1.onmessage = (e) => { clearTimeout(t); resolve(e.data); };
+      (reg.active || navigator.serviceWorker.controller).postMessage(m, [ch.port2]);
+    });
+  };
+
+  const hex2buf = (h) => new Uint8Array(h.match(/.{2}/g).map((b) => parseInt(b, 16)));
+
+  $("f").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    $("go").disabled = true;
+    msg("Prüfe Passwort …", true);
+    try {
+      const meta = await (await fetch("./meta.json", { cache: "no-cache" })).json();
+      const base = await crypto.subtle.importKey(
+        "raw", new TextEncoder().encode($("pw").value), "PBKDF2", false, ["deriveKey"]);
+      const key = await crypto.subtle.deriveKey(
+        { name: "PBKDF2", hash: "SHA-256", salt: hex2buf(meta.salt), iterations: meta.iter },
+        base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+      // Probe-Entschlüsselung des Manifests — wirft bei falschem Passwort
+      const mf = new Uint8Array(await (await fetch("./" + meta.manifest, { cache: "no-cache" })).arrayBuffer());
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv: mf.subarray(0, 12) }, key, mf.subarray(12));
+      const r = await ask({ t: "unlock", key });
+      if (!r.ok) throw new Error(r.err || "Schlüssel konnte nicht gespeichert werden");
+      sessionStorage.setItem("naret-rl", "0");
+      msg("Willkommen! Lade …", true);
+      location.reload();
+    } catch (e) {
+      msg(e.name === "OperationError" ? "Falsches Passwort." : "Fehler: " + (e.message || e));
+      $("go").disabled = false;
+    }
+  });
+
+  // Bereits freigeschaltet (z. B. Deep-Link über die 404-Seite oder erster
+  // Besuch nach der Installation)? Dann neu laden, damit der Service Worker
+  // die Seite ausliefert. Der Zähler verhindert Endlosschleifen.
+  (async () => {
+    try {
+      const reloads = Number(sessionStorage.getItem("naret-rl") || 0);
+      const s = await ask({ t: "status" });
+      if (s.unlocked && reloads < 3) {
+        sessionStorage.setItem("naret-rl", String(reloads + 1));
+        location.reload();
+      }
+    } catch {}
+  })();
+})();
+</script>
+</body>
+</html>
